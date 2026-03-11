@@ -1,0 +1,15 @@
+services:
+  - type: web
+    runtime: docker
+    name: webagent
+    plan: free
+    region: oregon
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: WEBAGENT_ADMIN_TOKEN
+        generateValue: true
+      - key: WEBAGENT_ALLOWED_HOSTS
+        value: example.com
+      - key: WEBAGENT_RATE_LIMIT_PER_MINUTE
+        value: "30"
