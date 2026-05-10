@@ -21,11 +21,11 @@ import java.util.regex.Pattern;
 public final class SiteAuditor {
     private static final Pattern TITLE_PATTERN = Pattern.compile("<title>(.*?)</title>", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
     private static final Pattern META_DESCRIPTION_PATTERN = Pattern.compile(
-            "<meta\\s+name=[\"']description[\"']\\s+content=[\"'](.*?)[\"']\\s*/?>",
+            "<meta\\b(?=[^>]*\\bname=[\"']description[\"'])(?=[^>]*\\bcontent=[\"'](.*?)[\"'])[^>]*>",
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
     private static final Pattern LANG_PATTERN = Pattern.compile("<html[^>]*\\slang=[\"'](.*?)[\"']", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
     private static final Pattern CANONICAL_PATTERN = Pattern.compile(
-            "<link\\s+rel=[\"']canonical[\"']\\s+href=[\"'](.*?)[\"']\\s*/?>",
+            "<link\\b(?=[^>]*\\brel=[\"']canonical[\"'])(?=[^>]*\\bhref=[\"'](.*?)[\"'])[^>]*>",
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
     private static final Pattern HREF_PATTERN = Pattern.compile("href=[\"'](.*?)[\"']", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
@@ -44,6 +44,11 @@ public final class SiteAuditor {
             issues.add(new AuditIssue("error", "url", "The URL is not valid.", "Use a full URL such as https://example.com", false, ""));
             return new AuditReport(rawUrl, checkedAt, 0, 0, false, "Invalid URL.", issues);
         }
+        if (!isAuditableUrl(uri)) {
+            issues.add(new AuditIssue("error", "url", "The URL must be an HTTP or HTTPS URL with a host.",
+                    "Use a full public URL such as https://example.com.", false, ""));
+            return new AuditReport(rawUrl, checkedAt, 0, 0, false, "Invalid URL.", issues);
+        }
 
         HttpResponse<String> response;
         long start = System.nanoTime();
@@ -54,7 +59,15 @@ public final class SiteAuditor {
                     .GET()
                     .build();
             response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-        } catch (IOException | InterruptedException ex) {
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            issues.add(new AuditIssue("error", "availability",
+                    "The audit was interrupted before the site could be checked.",
+                    "Try the audit again.",
+                    false,
+                    ""));
+            return new AuditReport(rawUrl, checkedAt, 0, elapsedMs(start), false, "Audit interrupted.", issues);
+        } catch (IOException ex) {
             issues.add(new AuditIssue("error", "availability",
                     "The site could not be reached: " + ex.getMessage(),
                     "Check DNS, TLS, firewall rules, and upstream availability.",
@@ -149,7 +162,7 @@ public final class SiteAuditor {
             }
             try {
                 URI resolved = baseUri.resolve(href);
-                if (sameHost(baseUri, resolved)) {
+                if (isAuditableUrl(resolved) && sameHost(baseUri, resolved)) {
                     targets.add(resolved.toString());
                 }
             } catch (IllegalArgumentException ignored) {
@@ -177,7 +190,30 @@ public final class SiteAuditor {
                     .method("HEAD", HttpRequest.BodyPublishers.noBody())
                     .build();
             HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
+            if (response.statusCode() == 405) {
+                return isBrokenWithGet(url);
+            }
             return response.statusCode() >= 400;
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            return true;
+        } catch (Exception ex) {
+            return true;
+        }
+    }
+
+    private boolean isBrokenWithGet(String url) {
+        try {
+            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                    .timeout(Duration.ofSeconds(8))
+                    .header("User-Agent", "WebAgent/1.0")
+                    .GET()
+                    .build();
+            HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
+            return response.statusCode() >= 400;
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            return true;
         } catch (Exception ex) {
             return true;
         }
@@ -185,6 +221,14 @@ public final class SiteAuditor {
 
     private boolean sameHost(URI left, URI right) {
         return left.getHost() != null && left.getHost().equalsIgnoreCase(right.getHost());
+    }
+
+    private boolean isAuditableUrl(URI uri) {
+        String scheme = uri.getScheme();
+        return ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
+                && uri.getHost() != null
+                && !uri.getHost().isBlank()
+                && uri.getUserInfo() == null;
     }
 
     private void checkHeader(HttpHeaders headers, String name, List<AuditIssue> issues,

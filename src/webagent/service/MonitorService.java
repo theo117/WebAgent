@@ -28,11 +28,13 @@ public final class MonitorService {
         jobs.put(url, future);
     }
 
-    public void stop(String url) {
+    public boolean stop(String url) {
         ScheduledFuture<?> existing = jobs.remove(url);
         if (existing != null) {
             existing.cancel(false);
+            return true;
         }
+        return false;
     }
 
     public AuditReport latest(String url) {

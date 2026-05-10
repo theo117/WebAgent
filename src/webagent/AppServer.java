@@ -11,9 +11,11 @@ import webagent.util.Json;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.net.IDN;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.URLDecoder;
+import java.security.MessageDigest;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -33,7 +35,7 @@ public final class AppServer {
     private final MonitorService monitorService = new MonitorService(auditor);
     private final String adminToken = System.getenv("WEBAGENT_ADMIN_TOKEN");
     private final Set<String> allowedHosts = parseAllowedHosts(System.getenv("WEBAGENT_ALLOWED_HOSTS"));
-    private final int rateLimitPerMinute = parseInt(System.getenv("WEBAGENT_RATE_LIMIT_PER_MINUTE"), 30);
+    private final int rateLimitPerMinute = Math.max(1, parseInt(System.getenv("WEBAGENT_RATE_LIMIT_PER_MINUTE"), 30));
     private final Map<String, RateWindow> rateWindows = new HashMap<>();
 
     public AppServer(int port) throws IOException {
@@ -42,6 +44,7 @@ public final class AppServer {
         server.createContext("/api/health", this::handleHealth);
         server.createContext("/api/audit", this::handleAudit);
         server.createContext("/api/monitor/start", this::handleStartMonitor);
+        server.createContext("/api/monitor/stop", this::handleStopMonitor);
         server.createContext("/api/monitor/latest", this::handleLatestMonitor);
         server.createContext("/api/fix", this::handleFix);
     }
@@ -62,6 +65,9 @@ public final class AppServer {
         if (!requireAdmin(exchange)) {
             return;
         }
+        if (!requireMethod(exchange, "GET")) {
+            return;
+        }
         Map<String, String> params = queryParams(exchange.getRequestURI());
         String url = params.getOrDefault("url", "");
         if (!isAllowedTarget(url)) {
@@ -76,6 +82,9 @@ public final class AppServer {
         if (!requireAdmin(exchange)) {
             return;
         }
+        if (!requireMethod(exchange, "POST", "GET")) {
+            return;
+        }
         Map<String, String> params = queryParams(exchange.getRequestURI());
         String url = params.getOrDefault("url", "");
         if (!isAllowedTarget(url)) {
@@ -88,8 +97,28 @@ public final class AppServer {
         sendJson(exchange, 200, "{\"started\":true,\"url\":\"" + escape(url) + "\",\"intervalSeconds\":" + effectiveInterval + "}");
     }
 
+    private void handleStopMonitor(HttpExchange exchange) throws IOException {
+        if (!requireAdmin(exchange)) {
+            return;
+        }
+        if (!requireMethod(exchange, "POST", "GET")) {
+            return;
+        }
+        Map<String, String> params = queryParams(exchange.getRequestURI());
+        String url = params.getOrDefault("url", "");
+        if (!isAllowedTarget(url)) {
+            sendJson(exchange, 403, "{\"message\":\"Target host is not allowed.\"}");
+            return;
+        }
+        boolean stopped = monitorService.stop(url);
+        sendJson(exchange, 200, "{\"stopped\":" + stopped + ",\"url\":\"" + escape(url) + "\"}");
+    }
+
     private void handleLatestMonitor(HttpExchange exchange) throws IOException {
         if (!requireAdmin(exchange)) {
+            return;
+        }
+        if (!requireMethod(exchange, "GET")) {
             return;
         }
         Map<String, String> params = queryParams(exchange.getRequestURI());
@@ -180,16 +209,19 @@ public final class AppServer {
     }
 
     private void sendJson(HttpExchange exchange, int status, String body) throws IOException {
-        exchange.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
         send(exchange, status, body);
     }
 
     private void sendHtml(HttpExchange exchange, int status, String body) throws IOException {
-        exchange.getResponseHeaders().add("Content-Type", "text/html; charset=utf-8");
+        exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
         send(exchange, status, body);
     }
 
     private void send(HttpExchange exchange, int status, String body) throws IOException {
+        exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
+        exchange.getResponseHeaders().set("Referrer-Policy", "strict-origin-when-cross-origin");
+        exchange.getResponseHeaders().set("Cache-Control", "no-store");
         byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
         exchange.sendResponseHeaders(status, bytes.length);
         try (OutputStream output = exchange.getResponseBody()) {
@@ -207,12 +239,24 @@ public final class AppServer {
             return false;
         }
         String supplied = bearerToken(exchange);
-        if (!adminToken.equals(supplied)) {
+        if (!constantTimeEquals(adminToken, supplied)) {
             exchange.getResponseHeaders().add("WWW-Authenticate", "Bearer");
             sendJson(exchange, 401, "{\"message\":\"Unauthorized.\"}");
             return false;
         }
         return true;
+    }
+
+    private boolean requireMethod(HttpExchange exchange, String... allowedMethods) throws IOException {
+        String method = exchange.getRequestMethod();
+        for (String allowedMethod : allowedMethods) {
+            if (allowedMethod.equalsIgnoreCase(method)) {
+                return true;
+            }
+        }
+        exchange.getResponseHeaders().set("Allow", String.join(", ", allowedMethods));
+        sendJson(exchange, 405, "{\"message\":\"Method not allowed.\"}");
+        return false;
     }
 
     private String bearerToken(HttpExchange exchange) {
@@ -258,11 +302,21 @@ public final class AppServer {
         }
         try {
             URI uri = URI.create(rawUrl);
+            String scheme = uri.getScheme();
+            if (scheme == null || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))) {
+                return false;
+            }
+            if (uri.getUserInfo() != null) {
+                return false;
+            }
             String host = uri.getHost();
             if (host == null || host.isBlank()) {
                 return false;
             }
-            String normalizedHost = host.toLowerCase(Locale.ROOT);
+            String normalizedHost = normalizeHost(host);
+            if (normalizedHost.isBlank()) {
+                return false;
+            }
             if (allowedHosts.contains(normalizedHost)) {
                 return true;
             }
@@ -283,12 +337,30 @@ public final class AppServer {
             return hosts;
         }
         for (String part : raw.split(",")) {
-            String host = part.trim().toLowerCase(Locale.ROOT);
+            String host = normalizeHost(part.trim().replaceFirst("^https?://", "").replaceFirst("/.*$", ""));
             if (!host.isBlank()) {
                 hosts.add(host);
             }
         }
         return hosts;
+    }
+
+    private String normalizeHost(String host) {
+        try {
+            String normalized = host.trim().toLowerCase(Locale.ROOT);
+            if (normalized.endsWith(".")) {
+                normalized = normalized.substring(0, normalized.length() - 1);
+            }
+            return IDN.toASCII(normalized);
+        } catch (IllegalArgumentException ex) {
+            return "";
+        }
+    }
+
+    private boolean constantTimeEquals(String expected, String supplied) {
+        byte[] expectedBytes = expected.getBytes(StandardCharsets.UTF_8);
+        byte[] suppliedBytes = supplied.getBytes(StandardCharsets.UTF_8);
+        return MessageDigest.isEqual(expectedBytes, suppliedBytes);
     }
 
     private static final class RateWindow {
@@ -426,6 +498,7 @@ public final class AppServer {
                                 <input id="intervalSeconds" value="60" />
                                 <button onclick="runAudit()">Run audit</button>
                                 <button class="alt" onclick="startMonitor()">Start monitor</button>
+                                <button class="alt" onclick="stopMonitor()">Stop monitor</button>
                                 <button class="alt" onclick="latestMonitor()">Latest monitor result</button>
                                 <div id="auditResult" class="result"></div>
                             </section>
@@ -463,12 +536,21 @@ public final class AppServer {
                             };
                         }
 
+                        async function readJson(response) {
+                            const data = await response.json().catch(() => ({ message: 'The server returned a non-JSON response.' }));
+                            if (!response.ok) {
+                                data.status = response.status;
+                                data.statusText = response.statusText;
+                            }
+                            return data;
+                        }
+
                         async function runAudit() {
                             const url = document.getElementById('auditUrl').value;
                             const response = await fetch('/api/audit?url=' + encodeURIComponent(url), {
                                 headers: authHeaders()
                             });
-                            const data = await response.json();
+                            const data = await readJson(response);
                             document.getElementById('auditResult').textContent = pretty(data);
                         }
 
@@ -476,9 +558,20 @@ public final class AppServer {
                             const url = document.getElementById('auditUrl').value;
                             const intervalSeconds = document.getElementById('intervalSeconds').value;
                             const response = await fetch('/api/monitor/start?url=' + encodeURIComponent(url) + '&intervalSeconds=' + encodeURIComponent(intervalSeconds), {
+                                method: 'POST',
                                 headers: authHeaders()
                             });
-                            const data = await response.json();
+                            const data = await readJson(response);
+                            document.getElementById('auditResult').textContent = pretty(data);
+                        }
+
+                        async function stopMonitor() {
+                            const url = document.getElementById('auditUrl').value;
+                            const response = await fetch('/api/monitor/stop?url=' + encodeURIComponent(url), {
+                                method: 'POST',
+                                headers: authHeaders()
+                            });
+                            const data = await readJson(response);
                             document.getElementById('auditResult').textContent = pretty(data);
                         }
 
@@ -487,7 +580,7 @@ public final class AppServer {
                             const response = await fetch('/api/monitor/latest?url=' + encodeURIComponent(url), {
                                 headers: authHeaders()
                             });
-                            const data = await response.json();
+                            const data = await readJson(response);
                             document.getElementById('auditResult').textContent = pretty(data);
                         }
 
@@ -506,7 +599,7 @@ public final class AppServer {
                                 headers: authHeaders({ 'Content-Type': 'application/x-www-form-urlencoded' }),
                                 body
                             });
-                            const data = await response.json();
+                            const data = await readJson(response);
                             document.getElementById('fixResult').textContent = pretty(data);
                         }
                     </script>

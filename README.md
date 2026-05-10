@@ -79,10 +79,11 @@ Sensitive endpoints now require a bearer token from the `WEBAGENT_ADMIN_TOKEN` e
 
 - `/api/audit`
 - `/api/monitor/start`
+- `/api/monitor/stop`
 - `/api/monitor/latest`
 - `/api/fix`
 
-Audit and monitor targets are also restricted by `WEBAGENT_ALLOWED_HOSTS`.
+Audit and monitor targets are also restricted by `WEBAGENT_ALLOWED_HOSTS`. WebAgent only audits `http` and `https` URLs with a host, and rejects URLs with embedded credentials.
 
 Example:
 
@@ -96,6 +97,13 @@ Example request:
 ```powershell
 $headers = @{ Authorization = "Bearer your-secret-token" }
 Invoke-WebRequest -Headers $headers -UseBasicParsing "http://localhost:8080/api/audit?url=https://example.com"
+```
+
+Start and stop monitoring:
+
+```powershell
+Invoke-WebRequest -Method Post -Headers $headers -UseBasicParsing "http://localhost:8080/api/monitor/start?url=https://example.com&intervalSeconds=60"
+Invoke-WebRequest -Method Post -Headers $headers -UseBasicParsing "http://localhost:8080/api/monitor/stop?url=https://example.com"
 ```
 
 ## Notes
